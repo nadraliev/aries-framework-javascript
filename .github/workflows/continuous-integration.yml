@@ -101,8 +101,8 @@ jobs:
       - name: Run tests
         run: TEST_AGENT_PUBLIC_DID_SEED=${TEST_AGENT_PUBLIC_DID_SEED} GENESIS_TXN_PATH=${GENESIS_TXN_PATH} yarn test --coverage
 
-      - uses: codecov/codecov-action@v1
-        if: always()
+      # - uses: codecov/codecov-action@v1
+      #   if: always()
 
   version-stable:
     runs-on: ubuntu-20.04
@@ -148,7 +148,7 @@ jobs:
           echo "::set-output name=version::$NEW_VERSION"
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v3
+        uses: sicpa-foundation/actions/external/action-gh-release
         with:
           commit-message: |
             chore(release): v${{ steps.new-version.outputs.version }}
