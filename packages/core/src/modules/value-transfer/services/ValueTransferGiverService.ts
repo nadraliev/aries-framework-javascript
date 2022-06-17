@@ -315,6 +315,12 @@ export class ValueTransferGiverService {
     record.assertState(ValueTransferState.CashRemovalSent)
     record.assertRole(ValueTransferRole.Giver)
 
+    await this.valueTransferService.updateState(
+      record,
+      ValueTransferState.ReceiptReceived,
+      ValueTransferRecordStatus.Active
+    )
+
     const valueTransferDelta = receiptMessage.valueTransferDelta
     if (!valueTransferDelta) {
       const problemReport = new ProblemReportMessage({
