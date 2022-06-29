@@ -30,11 +30,17 @@ export class SecretResolverService implements SecretsResolver {
         secrets.push(secret_id)
       }
     }
+    console.log('find_secrets:')
+    console.log(secret_ids)
+    console.log(secrets)
     return secrets
   }
 
   public async get_secret(secret_id: string): Promise<Secret | null> {
     const key = await this.keyService.findByKid(secret_id)
+    console.log('get_secret:')
+    console.log(secret_id)
+    console.log(key)
     if (!key) return null
     return {
       id: key.id,

@@ -73,61 +73,66 @@ export class ValueTransferGiverService {
     record?: ValueTransferRecord
     message: RequestWitnessedMessage | ProblemReportMessage
   }> {
-    const { message: requestWitnessedMessage } = messageContext
+    console.time('ValueTransferGiverService.processRequestWitnessed')
+    try {
+      const { message: requestWitnessedMessage } = messageContext
 
-    const valueTransferMessage = requestWitnessedMessage.valueTransferMessage
-    if (!valueTransferMessage) {
-      const problemReport = new ProblemReportMessage({
-        to: requestWitnessedMessage.from,
-        pthid: requestWitnessedMessage.id,
-        body: {
-          code: 'e.p.req.bad-request',
-          comment: `Missing required base64 or json encoded attachment data for payment request with thread id ${requestWitnessedMessage.thid}`,
-        },
-      })
-      return { message: problemReport }
-    }
-
-    if (valueTransferMessage.isGiverSet) {
-      // ensure that DID exist in the wallet
-      const did = await this.didService.findById(valueTransferMessage.giverId)
-      if (!did) {
+      const valueTransferMessage = requestWitnessedMessage.valueTransferMessage
+      if (!valueTransferMessage) {
         const problemReport = new ProblemReportMessage({
           to: requestWitnessedMessage.from,
           pthid: requestWitnessedMessage.id,
           body: {
-            code: 'e.p.req.bad-giver',
-            comment: `Requested giver '${valueTransferMessage.giverId}' does not exist in the wallet`,
+            code: 'e.p.req.bad-request',
+            comment: `Missing required base64 or json encoded attachment data for payment request with thread id ${requestWitnessedMessage.thid}`,
           },
         })
-        return {
-          message: problemReport,
+        return { message: problemReport }
+      }
+
+      if (valueTransferMessage.isGiverSet) {
+        // ensure that DID exist in the wallet
+        const did = await this.didService.findById(valueTransferMessage.giverId)
+        if (!did) {
+          const problemReport = new ProblemReportMessage({
+            to: requestWitnessedMessage.from,
+            pthid: requestWitnessedMessage.id,
+            body: {
+              code: 'e.p.req.bad-giver',
+              comment: `Requested giver '${valueTransferMessage.giverId}' does not exist in the wallet`,
+            },
+          })
+          return {
+            message: problemReport,
+          }
         }
       }
+
+      const getterInfo = await this.wellKnownService.resolve(valueTransferMessage.getterId)
+      const witnessInfo = new DidInfo({ did: valueTransferMessage.witnessId })
+      const giverInfo = valueTransferMessage.isGiverSet ? new DidInfo({ did: valueTransferMessage.giverId }) : undefined
+
+      // Create Value Transfer record and raise event
+      const record = new ValueTransferRecord({
+        role: ValueTransferRole.Giver,
+        state: ValueTransferState.RequestReceived,
+        status: ValueTransferTransactionStatus.Pending,
+        threadId: requestWitnessedMessage.thid,
+        valueTransferMessage,
+        getter: getterInfo,
+        witness: witnessInfo,
+        giver: giverInfo,
+      })
+
+      await this.valueTransferRepository.save(record)
+      this.eventEmitter.emit<ValueTransferStateChangedEvent>({
+        type: ValueTransferEventTypes.ValueTransferStateChanged,
+        payload: { record },
+      })
+      return { record, message: requestWitnessedMessage }
+    } finally {
+      console.timeEnd('ValueTransferGiverService.processRequestWitnessed')
     }
-
-    const getterInfo = await this.wellKnownService.resolve(valueTransferMessage.getterId)
-    const witnessInfo = new DidInfo({ did: valueTransferMessage.witnessId })
-    const giverInfo = valueTransferMessage.isGiverSet ? new DidInfo({ did: valueTransferMessage.giverId }) : undefined
-
-    // Create Value Transfer record and raise event
-    const record = new ValueTransferRecord({
-      role: ValueTransferRole.Giver,
-      state: ValueTransferState.RequestReceived,
-      status: ValueTransferTransactionStatus.Pending,
-      threadId: requestWitnessedMessage.thid,
-      valueTransferMessage,
-      getter: getterInfo,
-      witness: witnessInfo,
-      giver: giverInfo,
-    })
-
-    await this.valueTransferRepository.save(record)
-    this.eventEmitter.emit<ValueTransferStateChangedEvent>({
-      type: ValueTransferEventTypes.ValueTransferStateChanged,
-      payload: { record },
-    })
-    return { record, message: requestWitnessedMessage }
   }
 
   /**
@@ -143,74 +148,79 @@ export class ValueTransferGiverService {
     record: ValueTransferRecord
     message: RequestAcceptedMessage | ProblemReportMessage
   }> {
-    // Verify that we are in appropriate state to perform action
-    record.assertRole(ValueTransferRole.Giver)
-    record.assertState(ValueTransferState.RequestReceived)
+    console.time('ValueTransferGiverService.acceptRequest')
+    try {
+      // Verify that we are in appropriate state to perform action
+      record.assertRole(ValueTransferRole.Giver)
+      record.assertState(ValueTransferState.RequestReceived)
 
-    const giverDid = record.giver ? record.giver.did : (await this.didService.createDID(DidType.PeerDid)).id
+      const giverDid = record.giver ? record.giver.did : (await this.didService.createDID(DidType.PeerDid)).id
 
-    const activeTransaction = await this.valueTransferService.getActiveTransaction()
-    if (activeTransaction.record) {
-      throw new AriesFrameworkError(
-        `Request cannot be accepted as there is another active transaction: ${activeTransaction.record?.id}`
+      const activeTransaction = await this.valueTransferService.getActiveTransaction()
+      if (activeTransaction.record) {
+        throw new AriesFrameworkError(
+          `Request cannot be accepted as there is another active transaction: ${activeTransaction.record?.id}`
+        )
+      }
+
+      // Call VTP to accept payment request
+      const { error: pickNotesError, notes: notesToSpend } = await this.giver.pickNotesToSpend(
+        record.valueTransferMessage.amount
       )
-    }
+      if (pickNotesError || !notesToSpend) {
+        throw new AriesFrameworkError(`Not enough notes to pay: ${record.valueTransferMessage.amount}`)
+      }
 
-    // Call VTP to accept payment request
-    const { error: pickNotesError, notes: notesToSpend } = await this.giver.pickNotesToSpend(
-      record.valueTransferMessage.amount
-    )
-    if (pickNotesError || !notesToSpend) {
-      throw new AriesFrameworkError(`Not enough notes to pay: ${record.valueTransferMessage.amount}`)
-    }
+      const { error, message, delta } = await this.giver.acceptPaymentRequest(
+        giverDid,
+        record.valueTransferMessage,
+        notesToSpend
+      )
+      if (error || !message || !delta) {
+        // VTP message verification failed
+        const problemReport = new ProblemReportMessage({
+          from: giverDid,
+          to: record.witness?.did,
+          pthid: record.threadId,
+          body: {
+            code: error?.code || 'invalid-payment-request',
+            comment: `Request verification failed. Error: ${error}`,
+          },
+        })
 
-    const { error, message, delta } = await this.giver.acceptPaymentRequest(
-      giverDid,
-      record.valueTransferMessage,
-      notesToSpend
-    )
-    if (error || !message || !delta) {
-      // VTP message verification failed
-      const problemReport = new ProblemReportMessage({
+        // Update Value Transfer record
+        record.problemReportMessage = problemReport
+        await this.valueTransferService.updateState(
+          record,
+          ValueTransferState.Failed,
+          ValueTransferTransactionStatus.Finished
+        )
+        return {
+          record,
+          message: problemReport,
+        }
+      }
+
+      // VTP message verification succeed
+      const requestAcceptedMessage = new RequestAcceptedMessage({
         from: giverDid,
         to: record.witness?.did,
-        pthid: record.threadId,
-        body: {
-          code: error?.code || 'invalid-payment-request',
-          comment: `Request verification failed. Error: ${error}`,
-        },
+        thid: record.threadId,
+        attachments: [ValueTransferBaseMessage.createValueTransferJSONAttachment(delta)],
       })
 
       // Update Value Transfer record
-      record.problemReportMessage = problemReport
+      record.giver = new DidInfo({ did: giverDid })
+      record.valueTransferMessage = message
       await this.valueTransferService.updateState(
         record,
-        ValueTransferState.Failed,
-        ValueTransferTransactionStatus.Finished
+        ValueTransferState.RequestAcceptanceSent,
+        ValueTransferTransactionStatus.InProgress
       )
-      return {
-        record,
-        message: problemReport,
-      }
+      return { record, message: requestAcceptedMessage }
+    } finally {
+      console.timeEnd('ValueTransferGiverService.acceptRequest')
     }
-
-    // VTP message verification succeed
-    const requestAcceptedMessage = new RequestAcceptedMessage({
-      from: giverDid,
-      to: record.witness?.did,
-      thid: record.threadId,
-      attachments: [ValueTransferBaseMessage.createValueTransferJSONAttachment(delta)],
-    })
-
-    // Update Value Transfer record
-    record.giver = new DidInfo({ did: giverDid })
-    record.valueTransferMessage = message
-    await this.valueTransferService.updateState(
-      record,
-      ValueTransferState.RequestAcceptanceSent,
-      ValueTransferTransactionStatus.InProgress
-    )
-    return { record, message: requestAcceptedMessage }
   }
 
   /**
@@ -228,70 +238,75 @@ export class ValueTransferGiverService {
     record: ValueTransferRecord
     message: CashRemovedMessage | ProblemReportMessage
   }> {
-    // Verify that we are in appropriate state to perform action
-    const { message: cashAcceptedWitnessedMessage } = messageContext
+    console.time('ValueTransferGiverService.processCashAcceptanceWitnessed')
+    try {
+      // Verify that we are in appropriate state to perform action
+      const { message: cashAcceptedWitnessedMessage } = messageContext
 
-    const record = await this.valueTransferRepository.getByThread(cashAcceptedWitnessedMessage.thid)
+      const record = await this.valueTransferRepository.getByThread(cashAcceptedWitnessedMessage.thid)
 
-    record.assertRole(ValueTransferRole.Giver)
-    record.assertState(ValueTransferState.RequestAcceptanceSent)
+      record.assertRole(ValueTransferRole.Giver)
+      record.assertState(ValueTransferState.RequestAcceptanceSent)
 
-    const valueTransferDelta = cashAcceptedWitnessedMessage.valueTransferDelta
-    if (!valueTransferDelta) {
-      const problemReport = new ProblemReportMessage({
+      const valueTransferDelta = cashAcceptedWitnessedMessage.valueTransferDelta
+      if (!valueTransferDelta) {
+        const problemReport = new ProblemReportMessage({
+          from: record.giver?.did,
+          to: record.witness?.did,
+          pthid: record.threadId,
+          body: {
+            code: 'e.p.req.bad-cash-acceptance',
+            comment: `Missing required base64 or json encoded attachment data for cash acceptance with thread id ${record.threadId}`,
+          },
+        })
+        return { record, message: problemReport }
+      }
+
+      // Call VTP package to remove cash
+      const { error, message, delta } = await this.giver.signReceipt(record.valueTransferMessage, valueTransferDelta)
+      if (error || !message || !delta) {
+        // VTP message verification failed
+        const problemReportMessage = new ProblemReportMessage({
+          from: record.giver?.did,
+          to: record.witness?.did,
+          pthid: record.threadId,
+          body: {
+            code: error?.code || 'invalid-cash-accepted',
+            comment: `Cash Acceptance verification failed. Error: ${error}`,
+          },
+        })
+
+        await this.giver.abortTransaction()
+        // Update Value Transfer record
+        record.problemReportMessage = problemReportMessage
+        await this.valueTransferService.updateState(
+          record,
+          ValueTransferState.Failed,
+          ValueTransferTransactionStatus.Finished
+        )
+        return { record, message: problemReportMessage }
+      }
+
+      // VTP message verification succeed
+      const cashRemovedMessage = new CashRemovedMessage({
         from: record.giver?.did,
         to: record.witness?.did,
-        pthid: record.threadId,
-        body: {
-          code: 'e.p.req.bad-cash-acceptance',
-          comment: `Missing required base64 or json encoded attachment data for cash acceptance with thread id ${record.threadId}`,
-        },
-      })
-      return { record, message: problemReport }
-    }
-
-    // Call VTP package to remove cash
-    const { error, message, delta } = await this.giver.signReceipt(record.valueTransferMessage, valueTransferDelta)
-    if (error || !message || !delta) {
-      // VTP message verification failed
-      const problemReportMessage = new ProblemReportMessage({
-        from: record.giver?.did,
-        to: record.witness?.did,
-        pthid: record.threadId,
-        body: {
-          code: error?.code || 'invalid-cash-accepted',
-          comment: `Cash Acceptance verification failed. Error: ${error}`,
-        },
+        thid: record.threadId,
+        attachments: [ValueTransferBaseMessage.createValueTransferJSONAttachment(delta)],
       })
 
-      await this.giver.abortTransaction()
       // Update Value Transfer record
-      record.problemReportMessage = problemReportMessage
+      record.valueTransferMessage = message
+
       await this.valueTransferService.updateState(
         record,
-        ValueTransferState.Failed,
-        ValueTransferTransactionStatus.Finished
+        ValueTransferState.CashSignatureSent,
+        ValueTransferTransactionStatus.InProgress
       )
-      return { record, message: problemReportMessage }
+      return { record, message: cashRemovedMessage }
+    } finally {
+      console.timeEnd('ValueTransferGiverService.processCashAcceptanceWitnessed')
     }
-
-    // VTP message verification succeed
-    const cashRemovedMessage = new CashRemovedMessage({
-      from: record.giver?.did,
-      to: record.witness?.did,
-      thid: record.threadId,
-      attachments: [ValueTransferBaseMessage.createValueTransferJSONAttachment(delta)],
-    })
-
-    // Update Value Transfer record
-    record.valueTransferMessage = message
-
-    await this.valueTransferService.updateState(
-      record,
-      ValueTransferState.CashSignatureSent,
-      ValueTransferTransactionStatus.InProgress
-    )
-    return { record, message: cashRemovedMessage }
   }
 
   /**
@@ -303,39 +318,44 @@ export class ValueTransferGiverService {
   public async removeCash(record: ValueTransferRecord): Promise<{
     record: ValueTransferRecord
   }> {
-    record.assertRole(ValueTransferRole.Giver)
-    record.assertState(ValueTransferState.CashSignatureSent)
+    console.time('ValueTransferGiverService.removeCash')
+    try {
+      record.assertRole(ValueTransferRole.Giver)
+      record.assertState(ValueTransferState.CashSignatureSent)
 
-    // Call VTP package to remove cash
-    const { error } = await this.giver.removeCash()
-    if (error) {
-      // VTP cash removal failed
-      const problemReportMessage = new ProblemReportMessage({
-        from: record.giver?.did,
-        to: record.witness?.did,
-        pthid: record.threadId,
-        body: {
-          code: error?.code || 'unable-to-remove-cash',
-          comment: `Failed to remove cash from the wallet. Error: ${error}`,
-        },
-      })
+      // Call VTP package to remove cash
+      const { error } = await this.giver.removeCash()
+      if (error) {
+        // VTP cash removal failed
+        const problemReportMessage = new ProblemReportMessage({
+          from: record.giver?.did,
+          to: record.witness?.did,
+          pthid: record.threadId,
+          body: {
+            code: error?.code || 'unable-to-remove-cash',
+            comment: `Failed to remove cash from the wallet. Error: ${error}`,
+          },
+        })
 
-      // Update Value Transfer record
-      record.problemReportMessage = problemReportMessage
+        // Update Value Transfer record
+        record.problemReportMessage = problemReportMessage
+        await this.valueTransferService.updateState(
+          record,
+          ValueTransferState.Failed,
+          ValueTransferTransactionStatus.Finished
+        )
+        return { record }
+      }
+
       await this.valueTransferService.updateState(
         record,
-        ValueTransferState.Failed,
+        ValueTransferState.WaitingReceipt,
         ValueTransferTransactionStatus.Finished
       )
       return { record }
+    } finally {
+      console.timeEnd('ValueTransferGiverService.removeCash')
     }
-
-    await this.valueTransferService.updateState(
-      record,
-      ValueTransferState.WaitingReceipt,
-      ValueTransferTransactionStatus.Finished
-    )
-    return { record }
   }
 
   /**
@@ -352,63 +372,68 @@ export class ValueTransferGiverService {
     record: ValueTransferRecord
     message: GiverReceiptMessage | ProblemReportMessage
   }> {
-    // Verify that we are in appropriate state to perform action
-    const { message: receiptMessage } = messageContext
+    console.time('ValueTransferGiverService.processReceipt')
+    try {
+      // Verify that we are in appropriate state to perform action
+      const { message: receiptMessage } = messageContext
 
-    const record = await this.valueTransferRepository.getByThread(receiptMessage.thid)
+      const record = await this.valueTransferRepository.getByThread(receiptMessage.thid)
 
-    record.assertState(ValueTransferState.WaitingReceipt)
-    record.assertRole(ValueTransferRole.Giver)
+      record.assertState(ValueTransferState.WaitingReceipt)
+      record.assertRole(ValueTransferRole.Giver)
 
-    await this.valueTransferService.updateState(
-      record,
-      ValueTransferState.ReceiptReceived,
-      ValueTransferTransactionStatus.InProgress
-    )
-
-    const valueTransferDelta = receiptMessage.valueTransferDelta
-    if (!valueTransferDelta) {
-      const problemReport = new ProblemReportMessage({
-        pthid: record.threadId,
-        body: {
-          code: 'invalid-payment-receipt',
-          comment: `Missing required base64 or json encoded attachment data for receipt with thread id ${record.threadId}`,
-        },
-      })
-      return { record, message: problemReport }
-    }
-
-    // Call VTP to process Receipt
-    const { error, message } = await this.giver.processReceipt(record.valueTransferMessage, valueTransferDelta)
-    if (error || !message) {
-      // VTP message verification failed
-      const problemReportMessage = new ProblemReportMessage({
-        pthid: receiptMessage.thid,
-        body: {
-          code: error?.code || 'invalid-payment-receipt',
-          comment: `Receipt verification failed. Error: ${error}`,
-        },
-      })
-
-      await this.giver.abortTransaction()
-      record.problemReportMessage = problemReportMessage
       await this.valueTransferService.updateState(
         record,
-        ValueTransferState.Failed,
+        ValueTransferState.ReceiptReceived,
+        ValueTransferTransactionStatus.InProgress
+      )
+
+      const valueTransferDelta = receiptMessage.valueTransferDelta
+      if (!valueTransferDelta) {
+        const problemReport = new ProblemReportMessage({
+          pthid: record.threadId,
+          body: {
+            code: 'invalid-payment-receipt',
+            comment: `Missing required base64 or json encoded attachment data for receipt with thread id ${record.threadId}`,
+          },
+        })
+        return { record, message: problemReport }
+      }
+
+      // Call VTP to process Receipt
+      const { error, message } = await this.giver.processReceipt(record.valueTransferMessage, valueTransferDelta)
+      if (error || !message) {
+        // VTP message verification failed
+        const problemReportMessage = new ProblemReportMessage({
+          pthid: receiptMessage.thid,
+          body: {
+            code: error?.code || 'invalid-payment-receipt',
+            comment: `Receipt verification failed. Error: ${error}`,
+          },
+        })
+
+        await this.giver.abortTransaction()
+        record.problemReportMessage = problemReportMessage
+        await this.valueTransferService.updateState(
+          record,
+          ValueTransferState.Failed,
+          ValueTransferTransactionStatus.Finished
+        )
+        return { record, message: problemReportMessage }
+      }
+
+      // VTP message verification succeed
+      record.valueTransferMessage = message
+      record.receipt = message
+
+      await this.valueTransferService.updateState(
+        record,
+        ValueTransferState.Completed,
         ValueTransferTransactionStatus.Finished
       )
-      return { record, message: problemReportMessage }
+      return { record, message: receiptMessage }
+    } finally {
+      console.timeEnd('ValueTransferGiverService.processReceipt')
     }
-
-    // VTP message verification succeed
-    record.valueTransferMessage = message
-    record.receipt = message
-
-    await this.valueTransferService.updateState(
-      record,
-      ValueTransferState.Completed,
-      ValueTransferTransactionStatus.Finished
-    )
-    return { record, message: receiptMessage }
   }
 }

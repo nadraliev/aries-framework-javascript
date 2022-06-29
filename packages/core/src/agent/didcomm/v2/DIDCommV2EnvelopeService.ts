@@ -52,9 +52,13 @@ export class DIDCommV2EnvelopeService {
   }
 
   public async packMessageEncrypted(payload: DIDCommV2Message, params: PackMessageParams): Promise<EncryptedMessage> {
-    const message = new this.didcomm.Message(payload)
+    console.log('Packing DIDComm message:')
+    console.log(JSON.stringify(payload))
+    console.log('PackMessageParams:')
+    console.log(JSON.stringify(params))
 
-    const [encryptedMsg] = await message.pack_encrypted(
+    const message = new this.didcomm.Message(payload)
+    const [encryptedMsg, metadata] = await message.pack_encrypted(
       params.toDID,
       params.fromDID || null,
       params.signByDID || null,
@@ -62,6 +66,11 @@ export class DIDCommV2EnvelopeService {
       this.secretResolverService,
       {}
     )
+
+    console.log(`Pack encrypted metadata: ${JSON.stringify(metadata)}`)
+    console.log('Encrypted message:')
+    console.log(JSON.stringify(encryptedMsg))
+
     return JsonEncoder.fromString(encryptedMsg)
   }
 

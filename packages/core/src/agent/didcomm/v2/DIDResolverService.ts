@@ -77,6 +77,10 @@ export class DIDResolverService implements DIDResolver {
       }
     }
 
+    console.log('resolveDID:')
+    console.log(did)
+    console.log(JSON.stringify(didDod))
+
     return didDod
   }
 
